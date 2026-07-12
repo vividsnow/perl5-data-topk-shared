@@ -60,6 +60,10 @@
 #define TK_MAX_KEYSIZE  4096             /* max inline key bytes */
 #define TK_NIL          0xFFFFFFFFU      /* empty slot-index sentinel (hash chains, heap) */
 
+#define TK_MODE_PLAIN   0U               /* integer counts (classic Space-Saving) */
+#define TK_MODE_DECAYED 1U               /* forward-decayed weighted counts (Cormode) */
+#define TK_RESCALE_LN   34.0             /* rescale the landmark once alpha*(now-L) exceeds this (g ~ 6e14) */
+
 #define TK_ERR(fmt, ...) do { if (errbuf) snprintf(errbuf, TK_ERR_BUFLEN, fmt, ##__VA_ARGS__); } while (0)
 
 /* ================================================================
@@ -95,7 +99,12 @@ struct TkHeader {
     uint32_t slotless_readers;  /* live readers holding the lock with no reader-slot */
     uint64_t stat_ops;                /* 88 */
     uint64_t bucket_off;              /* 96  offset of the hash bucket array */
-    uint8_t  _pad[152];               /* 104..255 */
+    uint32_t mode;                    /* 104 TK_MODE_PLAIN | TK_MODE_DECAYED */
+    uint32_t _pad2;                   /* 108 */
+    double   alpha;                   /* 112 decay rate ln(2)/half_life (decayed mode; 0 if plain) */
+    double   now;                     /* 120 current time: max timestamp seen, or per-add tick */
+    double   landmark;                /* 128 forward-decay landmark L (decayed mode) */
+    uint8_t  _pad[120];               /* 136..255 */
 };
 typedef struct TkHeader TkHeader;
 
@@ -128,6 +137,8 @@ typedef struct TkHandle {
     uint32_t      key_size;      /* cached */
     uint64_t      hash_mask;     /* hash_buckets - 1, cached */
     uint64_t      stride;        /* per-slot byte stride, cached */
+    uint32_t      mode;          /* TK_MODE_* (cached from validated header) */
+    double        alpha;         /* decay rate (cached; 0 if plain) */
     size_t        mmap_size;
     char         *path;          /* backing file path (strdup'd) */
     int           backing_fd;    /* memfd or reopened-fd to close on destroy, -1 for file/anon */
@@ -582,7 +593,7 @@ static inline uint64_t tk_total_size(uint32_t m, uint32_t key_size) {
     return tk_layout_for(m, key_size).total;
 }
 
-static inline void tk_init_header(void *base, uint32_t m, uint32_t key_size, uint64_t total) {
+static inline void tk_init_header(void *base, uint32_t m, uint32_t key_size, uint32_t mode, double alpha, uint64_t total) {
     TkLayout L = tk_layout_for(m, key_size);
     TkHeader *hdr = (TkHeader *)base;
     /* Zero header + reader-slots + slots + heap, then set every hash bucket to
@@ -601,6 +612,10 @@ static inline void tk_init_header(void *base, uint32_t m, uint32_t key_size, uin
     hdr->reader_slots_off = L.reader_slots;
     hdr->heap_off         = L.heap;
     hdr->bucket_off       = L.buckets;
+    hdr->mode             = mode;
+    hdr->alpha            = alpha;
+    hdr->now              = 0.0;
+    hdr->landmark         = 0.0;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
@@ -648,6 +663,8 @@ static inline TkHandle *tk_setup(void *base, size_t map_size,
     h->key_size     = hdr->key_size;
     h->hash_mask    = hdr->hash_buckets - 1;
     h->stride       = tk_stride(hdr->key_size);
+    h->mode         = hdr->mode;
+    h->alpha        = hdr->alpha;
     h->mmap_size    = map_size;
     /* Layer B: if the mapping cannot even hold `capacity` slots the header lied
        about its size; clamp the cached capacity to what actually fits.  (Uses
@@ -666,6 +683,8 @@ static inline TkHandle *tk_setup(void *base, size_t map_size,
 static inline int tk_validate_header(const TkHeader *hdr, uint64_t file_size) {
     if (hdr->magic != TK_MAGIC) return 0;
     if (hdr->version != TK_VERSION) return 0;
+    if (hdr->mode != TK_MODE_PLAIN && hdr->mode != TK_MODE_DECAYED) return 0;
+    if (hdr->mode == TK_MODE_DECAYED && !(hdr->alpha > 0.0 && isfinite(hdr->alpha))) return 0;
     if (hdr->capacity < TK_MIN_CAP || hdr->capacity > TK_MAX_CAP) return 0;
     if (hdr->key_size < TK_MIN_KEYSIZE || hdr->key_size > TK_MAX_KEYSIZE) return 0;
     if (hdr->hash_buckets != tk_buckets_for(hdr->capacity)) return 0;
@@ -710,7 +729,7 @@ static int tk_secure_open(const char *path, mode_t mode, char *errbuf) {
     return -1;
 }
 
-static TkHandle *tk_create(const char *path, uint64_t capacity, uint64_t key_size, mode_t mode, char *errbuf) {
+static TkHandle *tk_create(const char *path, uint64_t capacity, uint64_t key_size, uint32_t tkmode, double alpha, mode_t mode, char *errbuf) {
     if (!tk_validate_args(capacity, key_size, errbuf)) return NULL;
 
     uint64_t total = tk_total_size((uint32_t)capacity, (uint32_t)key_size);
@@ -748,12 +767,12 @@ static TkHandle *tk_create(const char *path, uint64_t capacity, uint64_t key_siz
             return tk_setup(base, map_size, path, -1);
         }
     }
-    tk_init_header(base, (uint32_t)capacity, (uint32_t)key_size, total);
+    tk_init_header(base, (uint32_t)capacity, (uint32_t)key_size, tkmode, alpha, total);
     if (fd >= 0) { flock(fd, LOCK_UN); close(fd); }
     return tk_setup(base, map_size, path, -1);
 }
 
-static TkHandle *tk_create_memfd(const char *name, uint64_t capacity, uint64_t key_size, char *errbuf) {
+static TkHandle *tk_create_memfd(const char *name, uint64_t capacity, uint64_t key_size, uint32_t tkmode, double alpha, char *errbuf) {
     if (!tk_validate_args(capacity, key_size, errbuf)) return NULL;
 
     uint64_t total = tk_total_size((uint32_t)capacity, (uint32_t)key_size);
@@ -765,7 +784,7 @@ static TkHandle *tk_create_memfd(const char *name, uint64_t capacity, uint64_t k
     (void)fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
     void *base = mmap(NULL, (size_t)total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { TK_ERR("mmap: %s", strerror(errno)); close(fd); return NULL; }
-    tk_init_header(base, (uint32_t)capacity, (uint32_t)key_size, total);
+    tk_init_header(base, (uint32_t)capacity, (uint32_t)key_size, tkmode, alpha, total);
     return tk_setup(base, (size_t)total, NULL, fd);
 }
 
@@ -823,6 +842,23 @@ static inline uint64_t tk_hash(const void *key, size_t len) {
     return XXH3_64bits(key, len);
 }
 
+/* ---- forward-decay helpers (decayed mode stores a double's bits in count/error) ---- */
+static inline double   tk_w_get(uint64_t bits) { double d;   memcpy(&d, &bits, sizeof d); return d; }
+static inline uint64_t tk_w_bits(double d)     { uint64_t b; memcpy(&b, &d,   sizeof b); return b; }
+/* forward-decay factor g(now) = exp(alpha*(now - landmark)); >= 1, == 1 just after a rescale */
+static inline double tk_g(TkHandle *h) {
+    return exp(h->alpha * (h->hdr->now - h->hdr->landmark));
+}
+/* mode-aware count comparisons for the min-heap */
+static inline int tk_slot_lt(TkHandle *h, const TkSlot *a, const TkSlot *b) {
+    if (h->mode == TK_MODE_DECAYED) return tk_w_get(a->count) < tk_w_get(b->count);
+    return a->count < b->count;
+}
+static inline int tk_slot_le(TkHandle *h, const TkSlot *a, const TkSlot *b) {
+    if (h->mode == TK_MODE_DECAYED) return tk_w_get(a->count) <= tk_w_get(b->count);
+    return a->count <= b->count;
+}
+
 /* ---- min-heap over slot counts (heap[] holds slot indices) ---- */
 
 static inline void tk_heap_swap(TkHandle *h, uint32_t *heap, uint64_t a, uint64_t b) {
@@ -837,7 +873,7 @@ static void tk_sift_up(TkHandle *h, uint32_t *heap, uint64_t pos) {
         uint64_t parent = (pos - 1) / 2;
         uint32_t sp = heap[parent], sc = heap[pos];
         if (!TK_SLOT_OK(h, sp) || !TK_SLOT_OK(h, sc)) break;      /* Layer B */
-        if (tk_slot(h, sp)->count <= tk_slot(h, sc)->count) break;
+        if (tk_slot_le(h, tk_slot(h, sp), tk_slot(h, sc))) break;
         tk_heap_swap(h, heap, parent, pos);
         pos = parent;
     }
@@ -849,12 +885,12 @@ static void tk_sift_down(TkHandle *h, uint32_t *heap, uint64_t size, uint64_t po
         if (l < size) {
             uint32_t sl = heap[l], ss = heap[smallest];
             if (TK_SLOT_OK(h, sl) && TK_SLOT_OK(h, ss) &&
-                tk_slot(h, sl)->count < tk_slot(h, ss)->count) smallest = l;
+                tk_slot_lt(h, tk_slot(h, sl), tk_slot(h, ss))) smallest = l;
         }
         if (r < size) {
             uint32_t sr = heap[r], ss = heap[smallest];
             if (TK_SLOT_OK(h, sr) && TK_SLOT_OK(h, ss) &&
-                tk_slot(h, sr)->count < tk_slot(h, ss)->count) smallest = r;
+                tk_slot_lt(h, tk_slot(h, sr), tk_slot(h, ss))) smallest = r;
         }
         if (smallest == pos) break;
         tk_heap_swap(h, heap, pos, smallest);
@@ -915,19 +951,47 @@ static inline uint32_t tk_store_key(TkHandle *h, uint32_t s, const void *key, si
     return klen;
 }
 
+/* Rescale all weights by 1/g and advance the landmark to now, keeping the
+ * forward-decay weights bounded (decayed mode; caller holds the write lock). */
+static void tk_rescale(TkHandle *h) {
+    double g = tk_g(h);
+    if (!(g > 1.0) || !isfinite(g)) { h->hdr->landmark = h->hdr->now; return; }
+    double inv = 1.0 / g;
+    uint64_t used = tk_heap_size(h);
+    uint64_t smax = tk_slots_max(h);
+    if (used > smax) used = smax;                     /* Layer B */
+    for (uint64_t i = 0; i < used; i++) {
+        TkSlot *sl = tk_slot(h, i);
+        sl->count = tk_w_bits(tk_w_get(sl->count) * inv);
+        sl->error = tk_w_bits(tk_w_get(sl->error) * inv);
+    }
+    h->hdr->landmark = h->hdr->now;                   /* g(now) == 1 again */
+}
+
 /* Observe one item; returns the item's estimated count after this observation.
  * (caller holds the write lock) */
-static uint64_t tk_observe_locked(TkHandle *h, const void *item, size_t len) {
+static uint64_t tk_observe_locked(TkHandle *h, const void *item, size_t len, int has_ts, double ts) {
     if (h->capacity == 0) return 0;                        /* Layer B: unusable mapping */
     uint32_t klen = (len > h->key_size) ? h->key_size : (uint32_t)len;
     uint64_t hv = tk_hash(item, klen);
     h->hdr->seen++;
 
+    double g = 1.0;                                        /* increment weight (1 in plain mode) */
+    if (h->mode == TK_MODE_DECAYED) {
+        /* advance the monotonic clock: to ts if given and larger, else one tick */
+        if (has_ts) { if (ts > h->hdr->now) h->hdr->now = ts; }
+        else h->hdr->now += 1.0;
+        if (h->alpha * (h->hdr->now - h->hdr->landmark) > TK_RESCALE_LN)
+            tk_rescale(h);                                 /* advance the landmark to keep g bounded */
+        g = tk_g(h);
+    }
+
     uint32_t s = tk_hash_find(h, item, klen, hv);
     uint32_t *heap = tk_heap(h);
     if (s != TK_NIL) {                                     /* already monitored: bump */
         TkSlot *sl = tk_slot(h, s);
-        sl->count++;
+        if (h->mode == TK_MODE_DECAYED) sl->count = tk_w_bits(tk_w_get(sl->count) + g);
+        else                            sl->count++;
         uint64_t size = tk_heap_size(h);
         uint64_t pos = sl->heap_pos;
         if (pos < size) tk_sift_down(h, heap, size, pos); /* count rose -> sink it */
@@ -938,15 +1002,15 @@ static uint64_t tk_observe_locked(TkHandle *h, const void *item, size_t len) {
         uint32_t ns = (uint32_t)h->hdr->used;
         TkSlot *sl = tk_slot(h, ns);
         tk_store_key(h, ns, item, len);
-        sl->count = 1;
-        sl->error = 0;
+        sl->count = (h->mode == TK_MODE_DECAYED) ? tk_w_bits(g)   : 1;
+        sl->error = (h->mode == TK_MODE_DECAYED) ? tk_w_bits(0.0) : 0;
         sl->hnext = TK_NIL;
         sl->heap_pos = ns;
         heap[ns] = ns;
         tk_hash_insert(h, ns, hv);
         h->hdr->used++;
         tk_sift_up(h, heap, ns);
-        return 1;
+        return sl->count;
     }
 
     /* full: evict the minimum-count slot (heap root) */
@@ -956,10 +1020,16 @@ static uint64_t tk_observe_locked(TkHandle *h, const void *item, size_t len) {
     uint32_t old_kl = sl->key_len; if (old_kl > h->key_size) old_kl = h->key_size;
     uint64_t old_hv = tk_hash(tk_slot_key(sl), old_kl);
     tk_hash_remove(h, victim, old_hv);                    /* drop the evicted key */
-    uint64_t min_count = sl->count;
     tk_store_key(h, victim, item, len);
-    sl->error = min_count;                                /* over-estimate bound */
-    sl->count = min_count + 1;
+    if (h->mode == TK_MODE_DECAYED) {
+        double min_w = tk_w_get(sl->count);               /* victim's weight (heap minimum) */
+        sl->error = tk_w_bits(min_w);                     /* over-estimate bound */
+        sl->count = tk_w_bits(min_w + g);
+    } else {
+        uint64_t min_count = sl->count;
+        sl->error = min_count;
+        sl->count = min_count + 1;
+    }
     tk_hash_insert(h, victim, hv);
     tk_sift_down(h, heap, h->capacity, 0);                /* root's count rose -> sink it */
     return sl->count;

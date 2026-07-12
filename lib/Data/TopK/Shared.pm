@@ -1,7 +1,7 @@
 package Data::TopK::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 require XSLoader;
 XSLoader::load('Data::TopK::Shared', $VERSION);
 
@@ -15,7 +15,7 @@ __END__
 
 =head1 NAME
 
-Data::TopK::Shared - shared-memory top-k heavy hitters (Space-Saving)
+Data::TopK::Shared - shared-memory top-k heavy hitters (Space-Saving, optional time decay)
 
 =head1 SYNOPSIS
 
@@ -34,6 +34,11 @@ Data::TopK::Shared - shared-memory top-k heavy hitters (Space-Saving)
 
     # share the summary across processes via a backing file
     my $shared = Data::TopK::Shared->new("/tmp/hitters.tk", 100);
+
+    # time-decayed: recent hits outweigh old ones (half-life 3600 time units)
+    my $decayed = Data::TopK::Shared->new_decayed(undef, 100, 256, 3600);
+    $decayed->add($key, $epoch_seconds);   # optional timestamp; else a per-add tick
+    $decayed->top(10);                      # the heaviest *recent* hitters
 
 =head1 DESCRIPTION
 
@@ -63,6 +68,22 @@ Keys are handled by their B<byte> content, truncated to C<key_size> bytes
 Wide-character strings (any codepoint above 255) cause a "Wide character" croak
 -- encode to bytes first. B<Linux-only>. Requires 64-bit Perl.
 
+=head2 Time decay (recent hitters)
+
+A summary created with C<new_decayed($path, $capacity, $key_size, $half_life)>
+keeps a B<time-decayed> top-k: an observation's contribution B<halves every
+C<$half_life> time units>, so recent activity dominates and stale heavy hitters
+fade out. It uses B<forward decay> (Efraimidis / Cormode): counts are stored as
+decayed weights so the Space-Saving min-heap stays consistent, with an occasional
+internal landmark rescale to keep the weights bounded (no unbounded growth). Feed
+it with C<< $tk->add($key, $timestamp) >> -- C<$timestamp> is any non-decreasing
+number in your own units (epoch seconds, milliseconds, an event index); if you
+omit it, time advances one B<tick> per C<add>. A past (smaller) timestamp does not
+rewind the clock. C<estimate>, C<error>, and C<top> then report B<decayed> counts
+(floating point) as of the latest time seen; everything else -- eviction bounds,
+cross-process sharing, C<clear> -- works the same. A plain (non-decayed) summary
+is unchanged and on-disk compatible.
+
 =head1 METHODS
 
 =head2 Constructors
@@ -72,7 +93,14 @@ Wide-character strings (any codepoint above 255) cause a "Wide character" croak
     my $tk = Data::TopK::Shared->new_memfd($name, $capacity, $key_size);
     my $tk = Data::TopK::Shared->new_from_fd($fd);
 
-C<$capacity> is the number of counters (the maximum number of keys tracked at
+    # time-decayed (forward decay) -- extra half_life argument
+    my $tk = Data::TopK::Shared->new_decayed($path, $capacity, $key_size, $half_life);
+    my $tk = Data::TopK::Shared->new_decayed_memfd($name, $capacity, $key_size, $half_life);
+
+C<new_decayed> / C<new_decayed_memfd> take a final C<$half_life> (a finite number
+greater than 0, in whatever time units you feed to C<add>): a contribution's
+weight halves every C<$half_life> units. They croak on a non-positive or
+non-finite half-life. C<$capacity> is the number of counters (the maximum number of keys tracked at
 once, at least 1, up to 2^24) -- pick it a few times larger than the number of
 heavy hitters you want to reliably capture. C<$key_size> is the maximum bytes
 stored per key (default 256; longer keys are truncated). Memory is roughly
@@ -86,6 +114,7 @@ C<0600> (owner-only).
 =head2 Feeding and querying
 
     my $count = $tk->add($key);           # observe one key; returns its new estimated count
+    my $count = $tk->add($key, $t);       # decayed mode: observe at time $t (optional)
     $tk->observe($key);                   # alias for add
     my $n     = $tk->add_many(\@keys);    # observe a batch under one lock; returns the batch size
     my @top   = $tk->top($k);             # the $k heaviest as hashrefs, count-descending
@@ -110,7 +139,14 @@ a consistent pair under one lock, use the hashref C<top> returns for it.
     $tk->key_size;      # max bytes stored per key
     $tk->tracked;       # keys currently tracked: min(distinct seen, capacity)
     $tk->seen;          # total observations fed
-    $tk->stats;         # { capacity, key_size, tracked, seen, ops, mmap_size }
+    $tk->is_decayed;    # true for a time-decayed summary
+    $tk->half_life;     # the decay half-life (0 for a plain summary)
+    $tk->stats;         # { capacity, key_size, tracked, seen, ops, mmap_size, decayed[, half_life] }
+
+C<is_decayed> reports whether the summary is time-decayed; C<half_life> returns its
+half-life (0 for a plain summary). In decayed mode C<estimate>, C<error>, and the
+C<count>/C<error> fields of C<top> are B<decayed> counts (floating point) as of the
+latest observed time; C<stats> gains C<decayed> (and C<half_life> when decayed).
 
 =head2 Lifecycle
 

@@ -51,7 +51,7 @@ new(class, path = &PL_sv_undef, capacity = 0, key_size = 256, ...)
     /* Optional 5th arg: file mode for a newly-created file-backed segment
      * (default 0600, owner-only). Pass e.g. 0660 for cross-user sharing. */
     mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
-    TkHandle *h = tk_create(p, (uint64_t)capacity, (uint64_t)key_size, mode, errbuf);
+    TkHandle *h = tk_create(p, (uint64_t)capacity, (uint64_t)key_size, TK_MODE_PLAIN, 0.0, mode, errbuf);
     if (!h) croak("Data::TopK::Shared->new: %s", errbuf);
     MAKE_OBJ(class, h);
   OUTPUT:
@@ -69,8 +69,51 @@ new_memfd(class, name = &PL_sv_undef, capacity = 0, key_size = 256)
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;   /* undef -> default label */
     if (capacity < 1)
         croak("Data::TopK::Shared->new_memfd: capacity must be >= 1");
-    TkHandle *h = tk_create_memfd(nm, (uint64_t)capacity, (uint64_t)key_size, errbuf);
+    TkHandle *h = tk_create_memfd(nm, (uint64_t)capacity, (uint64_t)key_size, TK_MODE_PLAIN, 0.0, errbuf);
     if (!h) croak("Data::TopK::Shared->new_memfd: %s", errbuf);
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
+SV *
+new_decayed(class, path = &PL_sv_undef, capacity = 0, key_size = 256, half_life = 0, ...)
+    const char *class
+    SV *path
+    UV capacity
+    UV key_size
+    NV half_life
+  PREINIT:
+    char errbuf[TK_ERR_BUFLEN];
+  CODE:
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (capacity < 1) croak("Data::TopK::Shared->new_decayed: capacity must be >= 1");
+    if (!((double)half_life > 0.0) || !isfinite((double)half_life))
+        croak("Data::TopK::Shared->new_decayed: half_life must be a finite number > 0");
+    double alpha = log(2.0) / (double)half_life;
+    mode_t mode = (items > 5 && (SvGETMAGIC(ST(5)), SvOK(ST(5)))) ? (mode_t)SvUV(ST(5)) : 0600;
+    TkHandle *h = tk_create(p, (uint64_t)capacity, (uint64_t)key_size, TK_MODE_DECAYED, alpha, mode, errbuf);
+    if (!h) croak("Data::TopK::Shared->new_decayed: %s", errbuf);
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
+SV *
+new_decayed_memfd(class, name = &PL_sv_undef, capacity = 0, key_size = 256, half_life = 0)
+    const char *class
+    SV *name
+    UV capacity
+    UV key_size
+    NV half_life
+  PREINIT:
+    char errbuf[TK_ERR_BUFLEN];
+  CODE:
+    const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
+    if (capacity < 1) croak("Data::TopK::Shared->new_decayed_memfd: capacity must be >= 1");
+    if (!((double)half_life > 0.0) || !isfinite((double)half_life))
+        croak("Data::TopK::Shared->new_decayed_memfd: half_life must be a finite number > 0");
+    double alpha = log(2.0) / (double)half_life;
+    TkHandle *h = tk_create_memfd(nm, (uint64_t)capacity, (uint64_t)key_size, TK_MODE_DECAYED, alpha, errbuf);
+    if (!h) croak("Data::TopK::Shared->new_decayed_memfd: %s", errbuf);
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -97,20 +140,26 @@ DESTROY(self)
         if (h) { sv_setiv(SvRV(self), 0); tk_destroy(h); }   /* null first: activates EXTRACT's use-after-destroy croak + makes a double DESTROY a no-op */
     }
 
-UV
-add(self, item)
+SV *
+add(self, item, timestamp = &PL_sv_undef)
     SV *self
     SV *item
+    SV *timestamp
   PREINIT:
     EXTRACT(self);
     STRLEN n;
     const char *s;
+    int has_ts; double ts = 0.0, g = 1.0; uint64_t raw;
   CODE:
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
+    has_ts = (SvGETMAGIC(timestamp), SvOK(timestamp));   /* optional timestamp for decayed mode */
+    if (has_ts) ts = (double)SvNV(timestamp);
     tk_rwlock_wrlock(h);
-    RETVAL = (UV)tk_observe_locked(h, s, n);
+    raw = tk_observe_locked(h, s, n, has_ts, ts);
+    if (h->mode == TK_MODE_DECAYED) g = tk_g(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     tk_rwlock_wrunlock(h);
+    RETVAL = (h->mode == TK_MODE_DECAYED) ? newSVnv(tk_w_get(raw) / g) : newSVuv((UV)raw);
   OUTPUT:
     RETVAL
 
@@ -141,7 +190,7 @@ add_many(self, items)
             }
         }
         tk_rwlock_wrlock(h);                             /* locked region: NO croak-capable calls */
-        for (i = 0; i < cnt; i++) { tk_observe_locked(h, ps[i], ls[i]); processed++; }
+        for (i = 0; i < cnt; i++) { tk_observe_locked(h, ps[i], ls[i], 0, 0.0); processed++; }   /* decayed: per-add tick */
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);  /* a call always counts, even an empty batch */
         tk_rwlock_wrunlock(h);
     }
@@ -149,7 +198,7 @@ add_many(self, items)
   OUTPUT:
     RETVAL
 
-UV
+SV *
 estimate(self, item)
     SV *self
     SV *item
@@ -157,15 +206,18 @@ estimate(self, item)
     EXTRACT(self);
     STRLEN n;
     const char *s;
+    uint64_t raw; double g = 1.0;
   CODE:
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
     tk_rwlock_rdlock(h);
-    RETVAL = (UV)tk_estimate_locked(h, s, n, NULL);
+    raw = tk_estimate_locked(h, s, n, NULL);
+    if (h->mode == TK_MODE_DECAYED) g = tk_g(h);
     tk_rwlock_rdunlock(h);
+    RETVAL = (h->mode == TK_MODE_DECAYED) ? newSVnv(tk_w_get(raw) / g) : newSVuv((UV)raw);
   OUTPUT:
     RETVAL
 
-UV
+SV *
 error(self, item)
     SV *self
     SV *item
@@ -173,13 +225,14 @@ error(self, item)
     EXTRACT(self);
     STRLEN n;
     const char *s;
-    uint64_t err = 0;
+    uint64_t err = 0; double g = 1.0;
   CODE:
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
     tk_rwlock_rdlock(h);
     (void)tk_estimate_locked(h, s, n, &err);
+    if (h->mode == TK_MODE_DECAYED) g = tk_g(h);
     tk_rwlock_rdunlock(h);
-    RETVAL = (UV)err;                       /* 0 for an untracked key or an exact count */
+    RETVAL = (h->mode == TK_MODE_DECAYED) ? newSVnv(tk_w_get(err) / g) : newSVuv((UV)err);
   OUTPUT:
     RETVAL
 
@@ -205,6 +258,7 @@ top(self, k = 0)
            copied key bytes cannot then be evicted out from under us, and all
            Perl-value building happens after the unlock. */
         tk_rwlock_rdlock(h);
+        double g = (h->mode == TK_MODE_DECAYED) ? tk_g(h) : 1.0;   /* decay factor snapshot */
         used = tk_heap_size(h);            /* == used, clamped to capacity (Layer B) */
         for (i = 0; i < used; i++) {
             TkSlot *sl = tk_slot(h, i);
@@ -224,8 +278,13 @@ top(self, k = 0)
             for (i = 0; i < want; i++) {
                 HV *hv = newHV();
                 hv_stores(hv, "key",   newSVpvn(keys + ents[i].off, ents[i].klen));
-                hv_stores(hv, "count", newSVuv((UV)ents[i].count));
-                hv_stores(hv, "error", newSVuv((UV)ents[i].error));
+                if (h->mode == TK_MODE_DECAYED) {
+                    hv_stores(hv, "count", newSVnv(tk_w_get(ents[i].count) / g));
+                    hv_stores(hv, "error", newSVnv(tk_w_get(ents[i].error) / g));
+                } else {
+                    hv_stores(hv, "count", newSVuv((UV)ents[i].count));
+                    hv_stores(hv, "error", newSVuv((UV)ents[i].error));
+                }
                 PUSHs(sv_2mortal(newRV_noinc((SV *)hv)));
             }
         }
@@ -259,6 +318,26 @@ key_size(self)
     EXTRACT(self);
   CODE:
     RETVAL = (UV)h->hdr->key_size;
+  OUTPUT:
+    RETVAL
+
+int
+is_decayed(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = (h->mode == TK_MODE_DECAYED) ? 1 : 0;   /* cached mode, no lock */
+  OUTPUT:
+    RETVAL
+
+NV
+half_life(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = (h->mode == TK_MODE_DECAYED && h->alpha > 0.0) ? (NV)(log(2.0) / h->alpha) : (NV)0.0;
   OUTPUT:
     RETVAL
 
@@ -314,6 +393,9 @@ stats(self)
         hv_stores(hv, "seen",      newSVuv((UV)seen));
         hv_stores(hv, "ops",       newSVuv((UV)ops));
         hv_stores(hv, "mmap_size", newSVuv((UV)h->mmap_size));
+        hv_stores(hv, "decayed",   newSViv(h->mode == TK_MODE_DECAYED ? 1 : 0));
+        if (h->mode == TK_MODE_DECAYED && h->alpha > 0.0)
+            hv_stores(hv, "half_life", newSVnv(log(2.0) / h->alpha));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
