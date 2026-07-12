@@ -685,6 +685,7 @@ static inline int tk_validate_header(const TkHeader *hdr, uint64_t file_size) {
     if (hdr->version != TK_VERSION) return 0;
     if (hdr->mode != TK_MODE_PLAIN && hdr->mode != TK_MODE_DECAYED) return 0;
     if (hdr->mode == TK_MODE_DECAYED && !(hdr->alpha > 0.0 && isfinite(hdr->alpha))) return 0;
+    if (hdr->mode == TK_MODE_DECAYED && (!isfinite(hdr->now) || !isfinite(hdr->landmark))) return 0;
     if (hdr->capacity < TK_MIN_CAP || hdr->capacity > TK_MAX_CAP) return 0;
     if (hdr->key_size < TK_MIN_KEYSIZE || hdr->key_size > TK_MAX_KEYSIZE) return 0;
     if (hdr->hash_buckets != tk_buckets_for(hdr->capacity)) return 0;
@@ -955,8 +956,8 @@ static inline uint32_t tk_store_key(TkHandle *h, uint32_t s, const void *key, si
  * forward-decay weights bounded (decayed mode; caller holds the write lock). */
 static void tk_rescale(TkHandle *h) {
     double g = tk_g(h);
-    if (!(g > 1.0) || !isfinite(g)) { h->hdr->landmark = h->hdr->now; return; }
-    double inv = 1.0 / g;
+    if (!(g > 1.0)) { h->hdr->landmark = h->hdr->now; return; }   /* g <= 1 or NaN: nothing to rescale */
+    double inv = isfinite(g) ? 1.0 / g : 0.0;   /* g == +Inf: a huge time gap fully decayed all old weight -> 0 */
     uint64_t used = tk_heap_size(h);
     uint64_t smax = tk_slots_max(h);
     if (used > smax) used = smax;                     /* Layer B */

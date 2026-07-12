@@ -153,7 +153,7 @@ add(self, item, timestamp = &PL_sv_undef)
   CODE:
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
     has_ts = (SvGETMAGIC(timestamp), SvOK(timestamp));   /* optional timestamp for decayed mode */
-    if (has_ts) ts = (double)SvNV(timestamp);
+    if (has_ts) { ts = (double)SvNV(timestamp); if (!isfinite(ts)) has_ts = 0; }   /* ignore Inf/NaN -> per-add tick */
     tk_rwlock_wrlock(h);
     raw = tk_observe_locked(h, s, n, has_ts, ts);
     if (h->mode == TK_MODE_DECAYED) g = tk_g(h);

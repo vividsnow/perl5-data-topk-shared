@@ -125,4 +125,32 @@ my $LN2 = log(2);
     unlink $path;
 }
 
+# ---- regression: a non-finite timestamp must not brick the summary ----
+{
+    my $t = Data::TopK::Shared->new_decayed(undef, 8, 16, 10);
+    my $inf = "Inf" + 0; my $nan = "NaN" + 0;   # NOT 9e999 (finite on -Duselongdouble)
+    $t->add("a", 5);
+    $t->add("a", $inf);          # Inf timestamp -> ignored (per-add tick), not a poison
+    $t->add("a", $nan);          # NaN timestamp -> ignored
+    my $e = $t->estimate("a");
+    ok $e == $e && $e < 1e9, 'Inf/NaN timestamp does not NaN-brick the estimate';
+    $t->add("b", 10);
+    ok $t->estimate("b") == $t->estimate("b"), 'summary still usable after a non-finite timestamp';
+}
+
+# ---- regression: a huge time gap fully decays old weight (no g=Inf stale weights) ----
+{
+    my $t = Data::TopK::Shared->new_decayed(undef, 8, 16, 10);   # half-life 10
+    $t->add("old", $_) for 100, 101, 102;
+    $t->add("new", 200000);      # gap far past the exp-overflow point -> old must decay to ~0
+    cmp_ok $t->estimate("old"), '<', 1e-6, 'old weight fully decays across a huge gap';
+    cmp_ok $t->estimate("new"), '>', $t->estimate("old"), 'new dominates after the gap';
+    is +($t->top(1))[0]{key}, "new", 'top-1 is the recent key after a huge gap';
+
+    my $u = Data::TopK::Shared->new_decayed(undef, 4, 16, 1e-4);  # alpha huge: each tick overflows g
+    $u->add("z") for 1 .. 10;
+    my $ez = $u->estimate("z");
+    ok $ez == $ez && abs($ez - 1) < 0.5, 'tiny half-life: estimate stays ~1 (no stale accumulation)';
+}
+
 done_testing;
