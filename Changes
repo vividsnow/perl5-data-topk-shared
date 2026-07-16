@@ -1,10 +1,7 @@
 Revision history for Data-TopK-Shared
 
-0.02      2026-07-12
-          - Add time-decayed mode (new_decayed / new_decayed_memfd): forward
-            decay so recent hits outweigh old ones, with an optional per-add
-            timestamp. estimate/error/top report decayed counts; is_decayed /
-            half_life introspection. Plain mode unchanged and file-compatible.
+0.02      2026-07-21
+          - Resolve argument magic before capturing the path string.
 
 0.01      2026-07-10
           - Initial release.

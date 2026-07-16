@@ -9,7 +9,18 @@
     if (!sv_isobject(sv) || !sv_derived_from(sv, "Data::TopK::Shared")) \
         croak("Expected a Data::TopK::Shared object"); \
     TkHandle *h = INT2PTR(TkHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Attempted to use a destroyed Data::TopK::Shared object")
+    if (!h) croak("Attempted to use a destroyed Data::TopK::Shared object"); \
+    sv_2mortal(SvREFCNT_inc(SvRV(sv)))
+
+/* Re-read the handle after a call that can run Perl code (tied/overloaded
+ * argument magic, tied-array fetches).  That code may call $obj->DESTROY
+ * explicitly, which frees the handle and zeroes the IV; EXTRACT's mortal
+ * pins the referent only against refcount-driven destruction, not an
+ * explicit DESTROY, so the local `h` would dangle.  Used only where magic
+ * can actually intervene between EXTRACT and the first use of h. */
+#define REEXTRACT(sv) \
+    h = INT2PTR(TkHandle*, SvIV(SvRV(sv))); \
+    if (!h) croak("Data::TopK::Shared object destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -45,12 +56,16 @@ new(class, path = &PL_sv_undef, capacity = 0, key_size = 256, ...)
   PREINIT:
     char errbuf[TK_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     if (capacity < 1)
         croak("Data::TopK::Shared->new: capacity must be >= 1");
     /* Optional 5th arg: file mode for a newly-created file-backed segment
-     * (default 0600, owner-only). Pass e.g. 0660 for cross-user sharing. */
+     * (default 0600, owner-only). Pass e.g. 0660 for cross-user sharing.
+     * Resolve its magic BEFORE capturing path's PV below: SvGETMAGIC runs
+     * arbitrary Perl that could realloc or free that PV. */
     mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
+    /* Capture the path PV LAST, immediately before tk_create(): no get-magic
+     * may run between the capture and its use, or p could dangle. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     TkHandle *h = tk_create(p, (uint64_t)capacity, (uint64_t)key_size, TK_MODE_PLAIN, 0.0, mode, errbuf);
     if (!h) croak("Data::TopK::Shared->new: %s", errbuf);
     MAKE_OBJ(class, h);
@@ -85,12 +100,16 @@ new_decayed(class, path = &PL_sv_undef, capacity = 0, key_size = 256, half_life 
   PREINIT:
     char errbuf[TK_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     if (capacity < 1) croak("Data::TopK::Shared->new_decayed: capacity must be >= 1");
     if (!((double)half_life > 0.0) || !isfinite((double)half_life))
         croak("Data::TopK::Shared->new_decayed: half_life must be a finite number > 0");
     double alpha = log(2.0) / (double)half_life;
+    /* Resolve the optional mode arg's magic BEFORE capturing path's PV below:
+     * SvGETMAGIC runs arbitrary Perl that could realloc or free that PV. */
     mode_t mode = (items > 5 && (SvGETMAGIC(ST(5)), SvOK(ST(5)))) ? (mode_t)SvUV(ST(5)) : 0600;
+    /* Capture the path PV LAST, immediately before tk_create(): no get-magic
+     * may run between the capture and its use, or p could dangle. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     TkHandle *h = tk_create(p, (uint64_t)capacity, (uint64_t)key_size, TK_MODE_DECAYED, alpha, mode, errbuf);
     if (!h) croak("Data::TopK::Shared->new_decayed: %s", errbuf);
     MAKE_OBJ(class, h);
@@ -151,9 +170,14 @@ add(self, item, timestamp = &PL_sv_undef)
     const char *s;
     int has_ts; double ts = 0.0, g = 1.0; uint64_t raw;
   CODE:
-    s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
+    /* Resolve the optional timestamp's magic FIRST: a tied/overloaded timestamp
+     * runs arbitrary Perl in FETCH/numify that could realloc or free item's SV
+     * buffer. Capture item's bytes LAST so nothing runs between the capture and
+     * the locked use (add_many guards the same hazard by copying to a mortal). */
     has_ts = (SvGETMAGIC(timestamp), SvOK(timestamp));   /* optional timestamp for decayed mode */
     if (has_ts) { ts = (double)SvNV(timestamp); if (!isfinite(ts)) has_ts = 0; }   /* ignore Inf/NaN -> per-add tick */
+    s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
+    REEXTRACT(self);
     tk_rwlock_wrlock(h);
     raw = tk_observe_locked(h, s, n, has_ts, ts);
     if (h->mode == TK_MODE_DECAYED) g = tk_g(h);
@@ -173,6 +197,7 @@ add_many(self, items)
     IV  top;
     UV  processed = 0;
   CODE:
+    SvGETMAGIC(items);
     if (!SvROK(items) || SvTYPE(SvRV(items)) != SVt_PVAV)
         croak("Data::TopK::Shared->add_many: expected an array reference");
     av = (AV *)SvRV(items);
@@ -185,10 +210,18 @@ add_many(self, items)
             Newx(ls, cnt, STRLEN);       SAVEFREEPV(ls);
             for (i = 0; i < cnt; i++) {                  /* a croak here holds NO lock; SAVEFREEPV cleans up */
                 SV **el = av_fetch(av, (SSize_t)i, 0);
-                if (el && *el) ps[i] = SvPVbyte(*el, ls[i]);
-                else { ps[i] = ""; ls[i] = 0; }
+                if (el && *el) {
+                    STRLEN len;
+                    const char *src = SvPVbyte(*el, len); /* may run overload/tie/get-magic = arbitrary Perl */
+                    /* Copy bytes into a private mortal SV NOW: a LATER element SvPVbyte can
+                     * grow/free THIS element PV, dangling src before the locked loop uses it. */
+                    SV *copy = sv_2mortal(newSVpvn(src, len));
+                    ps[i] = SvPVX_const(copy);
+                    ls[i] = len;
+                } else { ps[i] = ""; ls[i] = 0; }
             }
         }
+        REEXTRACT(self);
         tk_rwlock_wrlock(h);                             /* locked region: NO croak-capable calls */
         for (i = 0; i < cnt; i++) { tk_observe_locked(h, ps[i], ls[i], 0, 0.0); processed++; }   /* decayed: per-add tick */
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);  /* a call always counts, even an empty batch */
@@ -209,6 +242,7 @@ estimate(self, item)
     uint64_t raw; double g = 1.0;
   CODE:
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
+    REEXTRACT(self);
     tk_rwlock_rdlock(h);
     raw = tk_estimate_locked(h, s, n, NULL);
     if (h->mode == TK_MODE_DECAYED) g = tk_g(h);
@@ -228,6 +262,7 @@ error(self, item)
     uint64_t err = 0; double g = 1.0;
   CODE:
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
+    REEXTRACT(self);
     tk_rwlock_rdlock(h);
     (void)tk_estimate_locked(h, s, n, &err);
     if (h->mode == TK_MODE_DECAYED) g = tk_g(h);
@@ -237,15 +272,16 @@ error(self, item)
     RETVAL
 
 void
-top(self, k = 0)
+top(self, ...)
     SV *self
-    UV k
   PREINIT:
     EXTRACT(self);
   PPCODE:
     {
+        UV k = (items > 1 && (SvGETMAGIC(ST(1)), SvOK(ST(1)))) ? SvUV(ST(1)) : 0;   /* optional; undef/omitted = 0 = all */
         TkEnt *ents = NULL;
         char  *keys = NULL;
+        REEXTRACT(self);
         uint64_t used, ks = h->key_size, i, cap = h->capacity;
         /* Allocate worst-case snapshot buffers (all `capacity` slots) BEFORE the
            lock: Newx can croak on OOM, and under the read lock that longjmp would
