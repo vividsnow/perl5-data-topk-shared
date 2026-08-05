@@ -773,7 +773,6 @@ static TkHandle *tk_create(const char *path, uint64_t capacity, uint64_t key_siz
                         TK_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty table */
                     tk_init_header(base, (uint32_t)capacity, (uint32_t)key_size, tkmode, alpha, total);
                     flock(fd, LOCK_UN); close(fd);
                     return tk_setup(base, map_size, path, -1);
