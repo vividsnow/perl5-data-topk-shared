@@ -594,9 +594,10 @@ static inline void tk_init_header(void *base, uint32_t m, uint32_t key_size, uin
     hdr->now              = 0.0;
     hdr->landmark         = 0.0;
     /* Publish magic LAST, as a release store: it is the commit point, so a
-       creator killed before this store leaves magic==0 -- which the
-       crashed-creator recovery treats as an abandoned mid-init file and
-       recovers, instead of a magic-set-but-incomplete header that would brick. */
+       creator killed before it leaves magic==0 and the file is never mistaken
+       for a valid one.  Recovery re-initializes such a file only while it is
+       still all-zero (a kill during the ftruncate or the zeroing above); a kill
+       during the few field stores leaves a file to remove by hand. */
     __atomic_store_n(&hdr->magic, TK_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
@@ -776,6 +777,11 @@ static TkHandle *tk_create(const char *path, uint64_t capacity, uint64_t key_siz
                     tk_init_header(base, (uint32_t)capacity, (uint32_t)key_size, tkmode, alpha, total);
                     flock(fd, LOCK_UN); close(fd);
                     return tk_setup(base, map_size, path, -1);
+                }
+                if (((TkHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
+                    && st.st_uid == geteuid()) {
+                    TK_ERR("%s: incomplete top-k table file left by an interrupted create; remove it and retry", path);
+                    munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                 }
                 TK_ERR("invalid top-k table file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
