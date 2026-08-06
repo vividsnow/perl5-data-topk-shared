@@ -1,5 +1,13 @@
 Revision history for Data-TopK-Shared
 
+0.04      2026-08-05
+          - xt/valgrind.t: run the real interpreter, not a wrapper script. Under
+            a shim perl (plenv, perlbrew) valgrind traced the shell and never saw
+            the XS, so the test passed regardless of what the module did.
+          - An interrupted create no longer leaves a file that can never be opened
+            again: such a file is re-initialized when it is provably empty and owned
+            by us, and is otherwise reported as incomplete rather than just invalid.
+
 0.03      2026-07-30
           - Reject a non-ref invocant replacement in the re-entrancy guard: a
             hostile tied or overloaded argument could crash the process mid-call;
